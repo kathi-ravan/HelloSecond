@@ -1,0 +1,209 @@
+package com.varicent.webform.web;
+
+import com.varicent.common.concurrency.service.ConcurrencyManager;
+import com.varicent.common.config.service.ConfigManager;
+import com.varicent.common.tab.domain.Tab;
+import com.varicent.core.exceptions.CycleException;
+import com.varicent.core.exceptions.DataSubmitException;
+import com.varicent.core.exceptions.DatabaseConcurrencyException;
+import com.varicent.core.exceptions.GlobalLockException;
+import com.varicent.core.exceptions.InvalidWebFormException;
+import com.varicent.core.i18n.Message;
+import com.varicent.core.i18n.Messages;
+import com.varicent.core.text.Format;
+import com.varicent.core.util.HttpRequestUtils;
+import com.varicent.webform.domain.ui.CellValue;
+import com.varicent.webform.domain.ui.WebForm;
+import com.varicent.webform.service.WebFormManager;
+import java.text.MessageFormat;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Enumeration;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.propertyeditors.CustomDateEditor;
+import org.springframework.context.i18n.LocaleContextHolder;
+import org.springframework.stereotype.Controller;
+import org.springframework.web.bind.WebDataBinder;
+import org.springframework.web.bind.annotation.InitBinder;
+import org.springframework.web.bind.annotation.ModelAttribute;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.servlet.ModelAndView;
+import org.springframework.web.util.HtmlUtils;
+import org.springframework.web.util.WebUtils;
+
+@Controller
+public class WebFormActionController {
+
+    private static final Pattern EDITED_CELL_PATTERN = Pattern.compile("^edit_(\\d+)_(\\d+)_(\\d+)_(.*+)$");
+    private static final String EXPORT_FILENAME_XLS = "webform-{0}.xls";
+    private static final String EXPORT_FILENAME_XLSX = "webform-{0}.xlsx";
+    private static final String VIEW = "webforms/index";
+    private static final String EXCEL_VIEW = "webFormExcelView";
+    private static final String ACTIVE_TAB_ATTRIBUTE = "activeTab";
+
+    private final ConfigManager configManager;
+    private final WebFormManager webFormManager;
+    private final ConcurrencyManager concurrencyManager;
+
+    @Autowired
+    public WebFormActionController(ConfigManager configManager, WebFormManager webFormManager, ConcurrencyManager concurrencyManager) {
+        this.configManager = configManager;
+        this.webFormManager = webFormManager;
+        this.concurrencyManager = concurrencyManager;
+    }
+
+    @InitBinder
+    public void initBinder(WebDataBinder binder) {
+        binder.registerCustomEditor(Date.class, (String) null, new CustomDateEditor(new SimpleDateFormat("dd/MM/yyyy"), true));
+    }
+
+    @RequestMapping(value = "/webforms/exportBatch.do")
+    public ModelAndView exportBatch(@ModelAttribute("command") WebFormCommand cmd, HttpServletRequest request, HttpServletResponse response) {
+        ModelAndView mav = new ModelAndView(EXCEL_VIEW);
+        if (cmd.checkAndUpdateToken()) {
+            try {
+                int resultRevision = configManager.getResultRevision();
+                int formId = cmd.getId();
+                mav.addObject("forms", webFormManager.exportForms(formId, cmd.getFilterValueMap(), HttpRequestUtils.getVisibleTabIdWorkflowObjectIdMap(request)));
+                mav.addObject("styles", webFormManager.getStyles(formId));
+                boolean isXLSXExport = cmd.getIsXLSXExport();
+                String fileName = isXLSXExport
+                        ? MessageFormat.format(EXPORT_FILENAME_XLSX, new Object[]{Format.asTimestamp(new Date())})
+                        : MessageFormat.format(EXPORT_FILENAME_XLS, new Object[]{Format.asTimestamp(new Date())});
+                mav.addObject("isXLSXExport", Boolean.valueOf(isXLSXExport));
+                mav.addObject("fileName", fileName);
+            } catch (DataSubmitException e) {
+                WebUtils.setSessionAttribute(request, "webFormError", e);
+                WebUtils.setSessionAttribute(request, "command", cmd);
+                return new ModelAndView("redirect:index.html");
+            } catch (InvalidWebFormException e) {
+                WebUtils.setSessionAttribute(request, "webFormError", e);
+            }
+        }
+        return mav;
+    }
+
+    @RequestMapping(value = "/webforms/export.do")
+    public ModelAndView exportCurrent(@ModelAttribute("command") WebFormCommand cmd, HttpServletRequest request, HttpServletResponse response) {
+        ModelAndView mav = new ModelAndView(EXCEL_VIEW);
+        if (cmd.checkAndUpdateToken()) {
+            try {
+                int resultRevision = configManager.getResultRevision();
+                int formId = cmd.getId();
+                WebForm form = webFormManager.getForm(formId, false, cmd.getFilterValueMap(), HttpRequestUtils.getVisibleTabIdWorkflowObjectIdMap(request));
+                mav.addObject("forms", Arrays.asList(form));
+                mav.addObject("styles", webFormManager.getStyles(formId));
+                boolean isXLSXExport = cmd.getIsXLSXExport();
+                String fileName = isXLSXExport
+                        ? MessageFormat.format(EXPORT_FILENAME_XLSX, new Object[]{Format.asTimestamp(new Date())})
+                        : MessageFormat.format(EXPORT_FILENAME_XLS, new Object[]{Format.asTimestamp(new Date())});
+                mav.addObject("isXLSXExport", Boolean.valueOf(isXLSXExport));
+                mav.addObject("fileName", fileName);
+            } catch (DataSubmitException e) {
+                WebUtils.setSessionAttribute(request, "webFormError", e);
+                WebUtils.setSessionAttribute(request, "command", cmd);
+                return new ModelAndView("redirect:index.html");
+            } catch (InvalidWebFormException e) {
+                WebUtils.setSessionAttribute(request, "webFormError", e);
+            }
+        }
+        return mav;
+    }
+
+    private String getActiveTabParameterUrl(HttpServletRequest request) {
+        Tab activeTab = (Tab) WebUtils.getSessionAttribute(request, ACTIVE_TAB_ATTRIBUTE);
+        if (activeTab != null) {
+            return activeTab.getParameterUrl();
+        }
+        return "";
+    }
+
+    @RequestMapping(value = "/webforms/edit.do")
+    public ModelAndView submitEdit(@ModelAttribute("command") WebFormCommand cmd, HttpServletRequest request) throws GlobalLockException {
+        String errorParam = "webFormError";
+        if (!cmd.checkAndUpdateToken()) {
+            return new ModelAndView("redirect:index.html");
+        }
+
+        concurrencyManager.checkAndUpdateToken();
+        String currentLocale = LocaleContextHolder.getLocale().toString();
+        String pageLanguage = cmd.getPageLocale();
+        String activeTabParameterUrl = getActiveTabParameterUrl(request);
+
+        if (currentLocale != null && !currentLocale.equals(pageLanguage)) {
+            WebUtils.setSessionAttribute(request, errorParam, new DataSubmitException(new Message(Messages.Key.LOCALE_PAGE_MISMATCH, new Object[]{})));
+        } else {
+            try {
+                webFormManager.submit(cmd.getId(), cmd.getFilterValueMap(), this.parseEditedCells(request), HttpRequestUtils.getVisibleTabIdWorkflowObjectIdMap(request));
+            } catch (DataSubmitException e) {
+                WebUtils.setSessionAttribute(request, errorParam, e);
+            } catch (DatabaseConcurrencyException e) {
+                WebUtils.setSessionAttribute(request, errorParam, e);
+            } catch (CycleException e) {
+                WebUtils.setSessionAttribute(request, errorParam, e);
+            }
+        }
+
+        cmd.setIsGLEdit(false);
+        WebUtils.setSessionAttribute(request, "command", cmd);
+
+        return new ModelAndView("redirect:" + "index.html" + activeTabParameterUrl);
+    }
+
+    private void assertSameResults(int resultRevision) {
+        if (configManager.getResultRevision() != resultRevision) {
+            throw new DataSubmitException(new Message(Messages.Key.WEBFORMS_ERROR_SUBMIT_CHANGES, new Object[]{}));
+        }
+    }
+
+    /**
+     * Parses edited cell values from request parameters matching the pattern edit_{elementId}_{row}_{column}_{hashKey}.
+     * FIX: All cell values are now HTML-escaped to prevent XSS attacks.
+     */
+    private List<CellValue> parseEditedCells(HttpServletRequest request) {
+        List<CellValue> values = new ArrayList<>();
+        Enumeration<?> paramNames = request.getParameterNames();
+
+        while (paramNames.hasMoreElements()) {
+            String name = (String) paramNames.nextElement();
+            Matcher matcher = EDITED_CELL_PATTERN.matcher(name);
+            if (matcher.matches()) {
+                int elementId = Integer.parseInt(matcher.group(1));
+                int row = Integer.parseInt(matcher.group(2));
+                int column = Integer.parseInt(matcher.group(3));
+                String hashKey = matcher.group(4);
+
+                String[] paramValues = request.getParameterValues(name);
+                List<String> cellValues = new ArrayList<>();
+
+                for (int i = 0; i < paramValues.length; i++) {
+                    // FIX: HTML-escape each cell value to prevent XSS attacks
+                    String sanitizedValue = HtmlUtils.htmlEscape(paramValues[i]);
+                    cellValues.add(sanitizedValue);
+                }
+
+                // Trim trailing empty values
+                for (int i = cellValues.size() - 1; i >= 0; i--) {
+                    if (((String) cellValues.get(i)).trim().isEmpty()) {
+                        cellValues.set(i, null);
+                    }
+                }
+
+                values.add(new CellValue(elementId, row, column, cellValues, hashKey));
+            }
+        }
+
+        Collections.sort(values);
+        return values;
+    }
+}
+
